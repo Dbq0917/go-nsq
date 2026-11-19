@@ -89,6 +89,7 @@ type Consumer struct {
 	messagesReceived uint64
 	messagesFinished uint64
 	messagesRequeued uint64
+	messagesInFlight int64
 	totalRdyCount    int64
 	backoffDuration  int64
 	backoffCounter   int32
@@ -121,6 +122,7 @@ type Consumer struct {
 
 	pendingConnections map[string]*Conn
 	connections        map[string]*Conn
+	reconnecting       map[string]bool
 
 	nsqdTCPAddrs []string
 
@@ -170,11 +172,16 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		logLvl:      LogLevelInfo,
 		maxInFlight: int32(config.MaxInFlight),
 
-		incomingMessages: make(chan *Message),
+		// The read loop must always be able to hand off up to the
+		// negotiated in-flight window. An unbuffered channel lets a busy
+		// handler block the read loop, which also prevents it from
+		// noticing that the connection has gone away.
+		incomingMessages: make(chan *Message, config.MaxInFlight),
 
 		rdyRetryTimers:     make(map[string]*time.Timer),
 		pendingConnections: make(map[string]*Conn),
 		connections:        make(map[string]*Conn),
+		reconnecting:       make(map[string]bool),
 
 		lookupdRecheckChan: make(chan int, 1),
 
@@ -288,6 +295,34 @@ func (r *Consumer) perConnMaxInFlight() int64 {
 	b := float64(r.getMaxInFlight())
 	s := b / float64(len(r.conns()))
 	return int64(math.Min(math.Max(1, s), b))
+}
+
+func (r *Consumer) reconnectingConn(c *Conn) bool {
+	r.mtx.RLock()
+	reconnecting := r.reconnecting[c.String()]
+	r.mtx.RUnlock()
+	return reconnecting
+}
+
+// perConnMaxInFlightFor calculates the RDY window for a connection. While a
+// connection is being re-established the window is capped by messages that
+// are still being processed on the previous connection, so a reconnect cannot
+// temporarily double the consumer's max-in-flight.
+func (r *Consumer) perConnMaxInFlightFor(c *Conn) int64 {
+	count := r.perConnMaxInFlight()
+	if !r.reconnectingConn(c) {
+		return count
+	}
+
+	otherInFlight := atomic.LoadInt64(&r.messagesInFlight) - atomic.LoadInt64(&c.messagesInFlight)
+	available := int64(r.getMaxInFlight()) - otherInFlight
+	if available < 1 {
+		available = 1
+	}
+	if count > available {
+		count = available
+	}
+	return count
 }
 
 // IsStarved indicates whether any connections for this consumer are blocked on processing
@@ -563,6 +598,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		r.mtx.Unlock()
 		return ErrAlreadyConnected
 	}
+	reconnecting := r.reconnecting[addr]
 	r.pendingConnections[addr] = conn
 	if idx := indexOf(addr, r.nsqdTCPAddrs); idx == -1 {
 		r.nsqdTCPAddrs = append(r.nsqdTCPAddrs, addr)
@@ -611,7 +647,21 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 			r.maybeUpdateRDY(c)
 		}
 	}
-	r.maybeUpdateRDY(conn)
+	if reconnecting {
+		// Start a reconnected client with a single message in flight and
+		// grow the window as the previous connection drains. This keeps a
+		// flapping connection from immediately asking nsqd for a full
+		// max-in-flight window.
+		count := int64(r.getMaxInFlight())
+		if count > 1 {
+			count = 1
+		}
+		if err := r.updateRDY(conn, count); err != nil {
+			r.log(LogLevelWarning, "(%s) error sending initial RDY %d: %v", conn, count, err)
+		}
+	} else {
+		r.maybeUpdateRDY(conn)
+	}
 
 	return nil
 }
@@ -638,6 +688,9 @@ func (r *Consumer) DisconnectFromNSQD(addr string) error {
 
 	// slice delete
 	r.nsqdTCPAddrs = append(r.nsqdTCPAddrs[:idx], r.nsqdTCPAddrs[idx+1:]...)
+	// Treat a later connection to this address as a reconnect so it
+	// re-negotiates RDY instead of immediately requesting a full window.
+	r.reconnecting[addr] = true
 
 	pendingConn, pendingOk := r.pendingConnections[addr]
 	conn, ok := r.connections[addr]
@@ -677,8 +730,31 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 }
 
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
+	atomic.AddInt64(&r.messagesInFlight, 1)
 	atomic.AddUint64(&r.messagesReceived, 1)
 	r.incomingMessages <- msg
+}
+
+func (r *Consumer) onConnMessageResponded(c *Conn, msg *Message) {
+	atomic.AddInt64(&r.messagesInFlight, -1)
+
+	// A reconnected connection grows its RDY window as work from the
+	// previous connection completes.
+	if !r.reconnectingConn(c) {
+		return
+	}
+	target := c
+	if c.IsClosing() {
+		for _, conn := range r.conns() {
+			if conn.String() == c.String() && !conn.IsClosing() {
+				target = conn
+				break
+			}
+		}
+	}
+	if !target.IsClosing() {
+		r.maybeUpdateRDY(target)
+	}
 }
 
 func (r *Consumer) onConnMessageFinished(c *Conn, msg *Message) {
@@ -737,7 +813,12 @@ func (r *Consumer) onConnClose(c *Conn) {
 	r.rdyRetryMtx.Unlock()
 
 	r.mtx.Lock()
-	delete(r.connections, c.String())
+	if conn, ok := r.connections[c.String()]; ok && conn == c {
+		delete(r.connections, c.String())
+	}
+	if indexOf(c.String(), r.nsqdTCPAddrs) >= 0 {
+		r.reconnecting[c.String()] = true
+	}
 	left := len(r.connections)
 	r.mtx.Unlock()
 
@@ -911,10 +992,16 @@ func (r *Consumer) maybeUpdateRDY(conn *Conn) {
 		return
 	}
 
-	count := r.perConnMaxInFlight()
+	count := r.perConnMaxInFlightFor(conn)
 	r.log(LogLevelDebug, "(%s) sending RDY %d", conn, count)
 	if err := r.updateRDY(conn, count); err != nil {
 		r.log(LogLevelWarning, "(%s) error sending RDY %d: %v", conn, count, err)
+		return
+	}
+	if r.reconnectingConn(conn) && count == r.perConnMaxInFlight() {
+		r.mtx.Lock()
+		delete(r.reconnecting, conn.String())
+		r.mtx.Unlock()
 	}
 }
 

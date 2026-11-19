@@ -516,6 +516,8 @@ func TestConsumerPause(t *testing.T) {
 		}
 	}
 done:
+	q.Stop()
+	<-q.StopChan
 
 	for i, r := range n.got {
 		t.Logf("%d: %s", i, r)

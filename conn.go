@@ -79,6 +79,7 @@ type Conn struct {
 	drainReady      chan int
 
 	closeFlag int32
+	abortFlag int32
 	stopper   sync.Once
 	wg        sync.WaitGroup
 
@@ -220,6 +221,16 @@ func (c *Conn) Close() error {
 		return c.conn.CloseRead()
 	}
 	return nil
+}
+
+// abort tears down the connection immediately after an unexpected transport
+// error. Any messages that were in flight on this connection are left
+// unacknowledged so that nsqd requeues them; they must not hold up the
+// reconnect path.
+func (c *Conn) abort() {
+	atomic.StoreInt32(&c.closeFlag, 1)
+	atomic.StoreInt32(&c.abortFlag, 1)
+	c.closeNow()
 }
 
 // IsClosing indicates whether or not the
@@ -527,6 +538,12 @@ func (c *Conn) readLoop() {
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
+				// The peer is gone. Close the socket and reconnect
+				// immediately instead of waiting for handlers that
+				// may never be able to acknowledge their messages.
+				if atomic.LoadInt64(&c.messagesInFlight) > 0 {
+					c.abort()
+				}
 			}
 			goto exit
 		}
@@ -676,8 +693,30 @@ func (c *Conn) close() {
 	})
 }
 
+// closeNow closes both directions of the underlying socket and starts the
+// cleanup path without waiting for outstanding messages.
+func (c *Conn) closeNow() {
+	c.stopper.Do(func() {
+		c.log(LogLevelInfo, "beginning close")
+		close(c.exitChan)
+		if c.conn != nil {
+			c.conn.Close()
+		}
+
+		c.wg.Add(1)
+		go c.cleanup()
+
+		go c.waitForCleanup()
+	})
+}
+
 func (c *Conn) cleanup() {
 	<-c.drainReady
+	if atomic.LoadInt32(&c.abortFlag) == 1 {
+		c.wg.Done()
+		c.log(LogLevelInfo, "aborted, cleanup exiting")
+		return
+	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	lastWarning := time.Now()
 	// writeLoop has exited, drain any remaining in flight messages
@@ -727,7 +766,15 @@ func (c *Conn) waitForCleanup() {
 }
 
 func (c *Conn) onMessageFinish(m *Message) {
-	c.msgResponseChan <- &msgResponse{msg: m, cmd: Finish(m.ID), success: true}
+	if d, ok := c.delegate.(interface {
+		OnMessageResponded(*Conn, *Message)
+	}); ok {
+		d.OnMessageResponded(c, m)
+	}
+	select {
+	case c.msgResponseChan <- &msgResponse{msg: m, cmd: Finish(m.ID), success: true}:
+	case <-c.exitChan:
+	}
 }
 
 func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
@@ -739,7 +786,15 @@ func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 			delay = c.config.MaxRequeueDelay
 		}
 	}
-	c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}
+	if d, ok := c.delegate.(interface {
+		OnMessageResponded(*Conn, *Message)
+	}); ok {
+		d.OnMessageResponded(c, m)
+	}
+	select {
+	case c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}:
+	case <-c.exitChan:
+	}
 }
 
 func (c *Conn) onMessageTouch(m *Message) {
