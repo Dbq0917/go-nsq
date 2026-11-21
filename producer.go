@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// pendingBufferSize bounds how many transactions publishers may enqueue
+// while the router is waiting to reconnect after a transient disconnect.
+// It only applies backpressure during an outage; the connected hot path is
+// unaffected.
+const pendingBufferSize = 1024
+
 type producerConn interface {
 	String() string
 	SetLogger(logger, LogLevel, string)
@@ -41,6 +47,7 @@ type Producer struct {
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
 	state           int32
+	routerRunning   int32
 
 	concurrentProducers int32
 	stopFlag            int32
@@ -84,7 +91,9 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 		logger: make([]logger, int(LogLevelMax+1)),
 		logLvl: LogLevelInfo,
 
-		transactionChan: make(chan *ProducerTransaction),
+		// buffered so publishers can keep enqueueing while the router is
+		// reconnecting; the router drains it in FIFO order once connected
+		transactionChan: make(chan *ProducerTransaction, pendingBufferSize),
 		exitChan:        make(chan int),
 		responseChan:    make(chan []byte),
 		errorChan:       make(chan []byte),
@@ -264,9 +273,12 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	atomic.AddInt32(&w.concurrentProducers, 1)
 	defer atomic.AddInt32(&w.concurrentProducers, -1)
 
-	if atomic.LoadInt32(&w.state) != StateConnected {
-		err := w.connect()
-		if err != nil {
+	// when the router is already alive (including while it is reconnecting
+	// after a transient disconnect), just hand the transaction over to it.
+	// It stays queued and is sent once the connection is back, preserving
+	// enqueue order instead of racing an independent dial here.
+	if atomic.LoadInt32(&w.routerRunning) == 0 {
+		if err := w.connect(); err != nil {
 			return err
 		}
 	}
@@ -302,6 +314,23 @@ func (w *Producer) connect() error {
 		return ErrNotConnected
 	}
 
+	err := w.dial()
+	if err != nil {
+		return err
+	}
+
+	if atomic.LoadInt32(&w.routerRunning) == 0 {
+		atomic.StoreInt32(&w.routerRunning, 1)
+		w.wg.Add(1)
+		go w.router()
+	}
+
+	return nil
+}
+
+// dial establishes a new underlying connection and marks the Producer as
+// connected. It must be called while holding w.guard.
+func (w *Producer) dial() error {
 	w.log(LogLevelInfo, "(%s) connecting to nsqd", w.addr)
 
 	w.conn = NewConn(w.addr, &w.config, &producerConnDelegate{w})
@@ -319,9 +348,6 @@ func (w *Producer) connect() error {
 	}
 	atomic.StoreInt32(&w.state, StateConnected)
 	w.closeChan = make(chan int)
-	w.wg.Add(1)
-	go w.router()
-
 	return nil
 }
 
@@ -330,39 +356,154 @@ func (w *Producer) close() {
 		return
 	}
 	w.conn.Close()
-	go func() {
-		// we need to handle this in a goroutine so we don't
-		// block the caller from making progress
-		w.wg.Wait()
-		atomic.StoreInt32(&w.state, StateInit)
-	}()
+	// the long-lived router observes the disconnect, resets the state and
+	// either reconnects or exits; doing the reset here would race with it
 }
 
+// router is the single goroutine that owns w.transactions. It runs for the
+// whole lifetime of the Producer, surviving transient disconnects so that
+// buffered transactions are preserved and replayed in order.
 func (w *Producer) router() {
+	defer w.wg.Done()
+
 	for {
+		// Only a connected connection may send. In every other state we
+		// block here until reconnected, so transactions published during an
+		// outage stay queued in FIFO order instead of being written to a
+		// dead connection (which would scramble their relative order).
+		if atomic.LoadInt32(&w.state) == StateDisconnected {
+			if !w.waitForConnShutdown() {
+				goto exit
+			}
+		}
+		if atomic.LoadInt32(&w.state) != StateConnected {
+			if !w.waitUntilConnected() {
+				goto exit
+			}
+			if !w.replayPendingTransactions() {
+				if atomic.LoadInt32(&w.stopFlag) == 1 {
+					goto exit
+				}
+				continue
+			}
+		}
+
 		select {
 		case t := <-w.transactionChan:
 			w.transactions = append(w.transactions, t)
+			// the connection can have dropped between the state check above
+			// and this receive; never write to a non-connected conn, since
+			// doing so would pull this transaction ahead of the queued ones
+			if atomic.LoadInt32(&w.state) != StateConnected {
+				continue
+			}
 			err := w.conn.WriteCommand(t.cmd)
 			if err != nil {
 				w.log(LogLevelError, "(%s) sending command - %s", w.conn.String(), err)
 				w.close()
+				// the dead connection must finish its shutdown (OnClose)
+				// before we reconnect, otherwise the state would never
+				// return to StateInit
+				if !w.waitForConnShutdown() {
+					goto exit
+				}
+				continue
 			}
 		case data := <-w.responseChan:
 			w.popTransaction(FrameTypeResponse, data)
 		case data := <-w.errorChan:
 			w.popTransaction(FrameTypeError, data)
 		case <-w.closeChan:
-			goto exit
+			// OnClose already fired; the connection is fully shut down
+			atomic.StoreInt32(&w.state, StateInit)
+			continue
 		case <-w.exitChan:
 			goto exit
 		}
 	}
 
 exit:
+	atomic.StoreInt32(&w.routerRunning, 0)
 	w.transactionCleanup()
-	w.wg.Done()
 	w.log(LogLevelInfo, "(%s) exiting router", w.conn.String())
+}
+
+// waitForConnShutdown blocks until the current connection finishes its
+// close sequence (OnClose, delivered via closeChan) and the state is back to
+// StateInit. It returns false if the Producer is stopped instead.
+func (w *Producer) waitForConnShutdown() bool {
+	select {
+	case <-w.closeChan:
+		atomic.StoreInt32(&w.state, StateInit)
+		return true
+	case <-w.exitChan:
+		return false
+	}
+}
+
+// waitUntilConnected blocks until a new connection is established, backing
+// off across repeated dial failures (common on flaky networks). Transactions
+// published meanwhile stay queued in w.transactionChan and are only handled
+// after the buffered backlog has been replayed. It returns false when the
+// Producer is stopped.
+func (w *Producer) waitUntilConnected() bool {
+	backoff := time.Second
+	for {
+		if atomic.LoadInt32(&w.stopFlag) == 1 {
+			return false
+		}
+
+		w.guard.Lock()
+		stopped := atomic.LoadInt32(&w.stopFlag) == 1
+		var err error
+		if !stopped && atomic.LoadInt32(&w.state) == StateInit {
+			err = w.dial()
+		}
+		w.guard.Unlock()
+		if stopped {
+			return false
+		}
+		if err == nil {
+			return true
+		}
+
+		w.log(LogLevelWarning, "(%s) reconnect failed - retrying in %s", w.addr, backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-w.exitChan:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+// replayPendingTransactions re-sends, in strict enqueue order, every
+// transaction that was buffered (already in w.transactions) when the
+// connection dropped. It runs on the router goroutine before the select
+// loop is resumed, so the backlog is always delivered ahead of transactions
+// that arrived in transactionChan while disconnected. This structural FIFO
+// replay preserves per-source ordering without per-message sequence numbers.
+//
+// It returns false when a write fails, in which case the connection has been
+// closed and the caller must reconnect and try again; the backlog is left
+// untouched so nothing is lost or reordered.
+func (w *Producer) replayPendingTransactions() bool {
+	for i, t := range w.transactions {
+		if err := w.conn.WriteCommand(t.cmd); err != nil {
+			w.log(LogLevelError, "(%s) replaying buffered command #%d - %s",
+				w.conn.String(), i, err)
+			w.close()
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Producer) popTransaction(frameType int32, data []byte) {
@@ -394,8 +535,9 @@ func (w *Producer) transactionCleanup() {
 	w.transactions = w.transactions[:0]
 
 	// spin and free up any writes that might have raced
-	// with the cleanup process (blocked on writing
-	// to transactionChan)
+	// with the cleanup process (blocked on writing to transactionChan).
+	// this only runs on a permanent Stop, so every racing write is
+	// failed rather than retained for replay.
 	for {
 		select {
 		case t := <-w.transactionChan:

@@ -316,7 +316,7 @@ func newMockProducerConn(delegate ConnDelegate) producerConn {
 	m := &mockProducerConn{
 		delegate: delegate,
 		closeCh:  make(chan struct{}),
-		pubCh:    make(chan struct{}, 4),
+		pubCh:    make(chan struct{}, 1024),
 	}
 	go m.router()
 	return m
@@ -343,7 +343,10 @@ func (m *mockProducerConn) Close() error {
 
 func (m *mockProducerConn) WriteCommand(cmd *Command) error {
 	if bytes.Equal(cmd.Name, []byte("PUB")) {
-		m.pubCh <- struct{}{}
+		select {
+		case m.pubCh <- struct{}{}:
+		default:
+		}
 	}
 	return nil
 }
@@ -370,6 +373,8 @@ func BenchmarkProducer(b *testing.B) {
 	p.conn = newMockProducerConn(&producerConnDelegate{p})
 	atomic.StoreInt32(&p.state, StateConnected)
 	p.closeChan = make(chan int)
+	atomic.StoreInt32(&p.routerRunning, 1)
+	p.wg.Add(1)
 	go p.router()
 
 	startCh := make(chan struct{})
