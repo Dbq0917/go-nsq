@@ -172,6 +172,8 @@ func consumerTest(t *testing.T, cb func(c *Config)) {
 	config.LocalAddr, _ = net.ResolveTCPAddr("tcp", laddr+":0")
 	// so that the test can simulate reaching max requeues and a call to LogFailedMessage
 	config.DefaultRequeueDelay = 0
+	// this test exercises the historical FailedMessageLogger path with the DLQ disabled
+	config.MaxDeadLetters = 0
 	// so that the test wont timeout from backing off
 	config.MaxBackoffDuration = time.Millisecond * 50
 	if cb != nil {

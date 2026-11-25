@@ -125,6 +125,19 @@ type Config struct {
 	// Maximum number of times this consumer will attempt to process a message before giving up
 	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"5"`
 
+	// Maximum number of dead letters retained by the Consumer's in-memory dead letter queue.
+	//
+	// A message whose processing attempts exceeded MaxAttempts is removed from its normal
+	// channel and stored in the dead letter queue together with its body, attempt count and
+	// the last handler error, so it can be inspected and replayed by operators.
+	//
+	// Once the queue holds this many entries the oldest dead letter is evicted (and counted
+	// in ConsumerStats.MessagesDeadLetteredDropped) to keep the queue bounded.
+	//
+	// Set to 0 to disable the dead letter queue; messages that exhaust MaxAttempts then keep
+	// the historical behavior of being finished and only reported via FailedMessageLogger.
+	MaxDeadLetters int `opt:"max_dead_letters" min:"0" max:"1000000" default:"1000"`
+
 	// Duration to wait for a message from an nsqd when in a state where RDY
 	// counts are re-distributed (e.g. max_in_flight < num_producers)
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`

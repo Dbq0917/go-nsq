@@ -59,10 +59,12 @@ type FailedMessageLogger interface {
 // ConsumerStats represents a snapshot of the state of a Consumer's connections and the messages
 // it has seen
 type ConsumerStats struct {
-	MessagesReceived uint64
-	MessagesFinished uint64
-	MessagesRequeued uint64
-	Connections      int
+	MessagesReceived            uint64
+	MessagesFinished            uint64
+	MessagesRequeued            uint64
+	MessagesDeadLettered        uint64
+	MessagesDeadLetteredDropped uint64
+	Connections                 int
 }
 
 var instCount int64
@@ -86,13 +88,14 @@ const (
 // reconnection) to any discovered nsqds.
 type Consumer struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messagesReceived uint64
-	messagesFinished uint64
-	messagesRequeued uint64
-	totalRdyCount    int64
-	backoffDuration  int64
-	backoffCounter   int32
-	maxInFlight      int32
+	messagesReceived     uint64
+	messagesFinished     uint64
+	messagesRequeued     uint64
+	messagesDeadLettered uint64
+	totalRdyCount        int64
+	backoffDuration      int64
+	backoffCounter       int32
+	maxInFlight          int32
 
 	mtx sync.RWMutex
 
@@ -106,6 +109,14 @@ type Consumer struct {
 	topic   string
 	channel string
 	config  Config
+
+	// dead letter queue holding messages that exhausted MaxAttempts; nil when disabled
+	dlq DeadLetterSink
+
+	// lastErrorMtx guards lastErrors, which keeps the most recent handler error for each
+	// in-flight message ID so it can be attached if the message is dead lettered
+	lastErrorMtx sync.Mutex
+	lastErrors   map[MessageID]string
 
 	rngMtx sync.Mutex
 	rng    *rand.Rand
@@ -176,12 +187,22 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		pendingConnections: make(map[string]*Conn),
 		connections:        make(map[string]*Conn),
 
+		lastErrors: make(map[MessageID]string),
+
 		lookupdRecheckChan: make(chan int, 1),
 
 		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 
 		StopChan: make(chan int),
 		exitChan: make(chan int),
+	}
+
+	if config.MaxDeadLetters > 0 {
+		r.dlq = NewDeadLetterQueue(config.MaxDeadLetters, func(letter *DeadLetter) {
+			r.log(LogLevelWarning,
+				"dead letter queue full (capacity %d), evicting oldest msg %s",
+				config.MaxDeadLetters, letter.ID)
+		})
 	}
 
 	// Set default logger for all log levels
@@ -197,12 +218,69 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 // Stats retrieves the current connection and message statistics for a Consumer
 func (r *Consumer) Stats() *ConsumerStats {
-	return &ConsumerStats{
-		MessagesReceived: atomic.LoadUint64(&r.messagesReceived),
-		MessagesFinished: atomic.LoadUint64(&r.messagesFinished),
-		MessagesRequeued: atomic.LoadUint64(&r.messagesRequeued),
-		Connections:      len(r.conns()),
+	var deadLetteredDropped uint64
+	if q, ok := r.dlq.(*deadLetterQueue); ok {
+		deadLetteredDropped = q.DroppedCount()
 	}
+	return &ConsumerStats{
+		MessagesReceived:            atomic.LoadUint64(&r.messagesReceived),
+		MessagesFinished:            atomic.LoadUint64(&r.messagesFinished),
+		MessagesRequeued:            atomic.LoadUint64(&r.messagesRequeued),
+		MessagesDeadLettered:        atomic.LoadUint64(&r.messagesDeadLettered),
+		MessagesDeadLetteredDropped: deadLetteredDropped,
+		Connections:                 len(r.conns()),
+	}
+}
+
+// DeadLetters returns a snapshot (oldest first) of the messages currently held
+// in the dead letter queue. It returns nil when the dead letter queue is disabled.
+func (r *Consumer) DeadLetters() []*DeadLetter {
+	if r.dlq == nil {
+		return nil
+	}
+	return r.dlq.DeadLetters()
+}
+
+// DeadLetter returns the dead letter stored for the given message ID, or nil if
+// there is no such entry (it was replayed, evicted or never dead lettered).
+func (r *Consumer) DeadLetter(id MessageID) *DeadLetter {
+	if r.dlq == nil {
+		return nil
+	}
+	for _, letter := range r.dlq.DeadLetters() {
+		if letter.ID == id {
+			return letter
+		}
+	}
+	return nil
+}
+
+// ReplayDeadLetter re-publishes the body of the dead letter with the given ID
+// back to its original topic via the supplied publisher (typically an *nsq.Producer).
+//
+// The dead letter is only removed from the queue after the publish succeeds, so a
+// failed replay leaves it available for another attempt. It returns an error when
+// the queue is disabled, the message cannot be found or the publish fails.
+func (r *Consumer) ReplayDeadLetter(id MessageID, publisher DeadLetterPublisher) error {
+	if publisher == nil {
+		return errors.New("a DeadLetterPublisher is required to replay a dead letter")
+	}
+	if r.dlq == nil {
+		return errors.New("dead letter queue is disabled")
+	}
+
+	letter := r.DeadLetter(id)
+	if letter == nil {
+		return fmt.Errorf("no dead letter found for msg %s", id)
+	}
+
+	if err := publisher.Publish(letter.Topic, letter.Body); err != nil {
+		return fmt.Errorf("failed to replay dead letter msg %s: %w", id, err)
+	}
+
+	r.dlq.Remove(id)
+	r.log(LogLevelWarning, "replayed dead letter msg %s to topic %s", id, letter.Topic)
+	return nil
 }
 
 func (r *Consumer) conns() []*Conn {
@@ -1142,19 +1220,21 @@ func (r *Consumer) handlerLoop(handler Handler) {
 		}
 
 		if r.shouldFailMessage(message, handler) {
-			message.Finish()
+			r.handleFailedMessage(message, handler)
 			continue
 		}
 
 		err := handler.HandleMessage(message)
 		if err != nil {
 			r.log(LogLevelError, "Handler returned error (%s) for msg %s", err, message.ID)
+			r.rememberError(message, err)
 			if !message.IsAutoResponseDisabled() {
 				message.Requeue(-1)
 			}
 			continue
 		}
 
+		r.forgetError(message)
 		if !message.IsAutoResponseDisabled() {
 			message.Finish()
 		}
@@ -1172,15 +1252,79 @@ func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool
 	if r.config.MaxAttempts > 0 && message.Attempts > r.config.MaxAttempts {
 		r.log(LogLevelWarning, "msg %s attempted %d times, giving up",
 			message.ID, message.Attempts)
-
-		logger, ok := handler.(FailedMessageLogger)
-		if ok {
-			logger.LogFailedMessage(message)
-		}
-
 		return true
 	}
 	return false
+}
+
+// rememberError records the latest handler error for a message so it can be
+// attached to the dead letter once the message exhausts its attempts.
+func (r *Consumer) rememberError(message *Message, err error) {
+	r.lastErrorMtx.Lock()
+	r.lastErrors[message.ID] = err.Error()
+	r.lastErrorMtx.Unlock()
+}
+
+// forgetError drops the recorded handler error for a message that finished
+// successfully so the tracking map does not grow without bound.
+func (r *Consumer) forgetError(message *Message) {
+	r.lastErrorMtx.Lock()
+	delete(r.lastErrors, message.ID)
+	r.lastErrorMtx.Unlock()
+}
+
+// handleFailedMessage deals with a message that exhausted MaxAttempts.
+//
+// When a dead letter queue is configured the message is moved there (with its
+// original body, attempt count and last error) and then finished on nsqd so it
+// leaves the normal channel and frees its position. When the queue is disabled
+// or rejects the message it is simply finished, preserving the historical
+// behavior; the bounded queue only evicts its own oldest entries, never the
+// new message, so the channel is always unblocked.
+func (r *Consumer) handleFailedMessage(message *Message, handler interface{}) {
+	deadLettered := false
+	if r.dlq != nil {
+		r.lastErrorMtx.Lock()
+		lastError := r.lastErrors[message.ID]
+		r.lastErrorMtx.Unlock()
+
+		body := make([]byte, len(message.Body))
+		copy(body, message.Body)
+
+		letter := &DeadLetter{
+			ID:                message.ID,
+			Body:              body,
+			Topic:             r.topic,
+			Channel:           r.channel,
+			NSQDAddress:       message.NSQDAddress,
+			Attempts:          message.Attempts,
+			LastError:         lastError,
+			OriginalTimestamp: message.Timestamp,
+			DeadLetteredAt:    time.Now(),
+		}
+
+		if err := r.dlq.Enqueue(letter); err != nil {
+			r.log(LogLevelError, "failed to dead letter msg %s - %s", message.ID, err)
+		} else {
+			atomic.AddUint64(&r.messagesDeadLettered, 1)
+			deadLettered = true
+		}
+	}
+
+	r.forgetError(message)
+
+	if !deadLettered {
+		// preserve the historical FailedMessageLogger hook when the message is not retained
+		if logger, ok := handler.(FailedMessageLogger); ok {
+			logger.LogFailedMessage(message)
+		}
+	} else {
+		r.log(LogLevelWarning,
+			"msg %s moved to dead letter queue after %d attempts", message.ID, message.Attempts)
+	}
+
+	// FIN releases the channel position regardless of whether the message was retained
+	message.Finish()
 }
 
 func (r *Consumer) exit() {

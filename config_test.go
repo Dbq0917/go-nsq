@@ -66,6 +66,29 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestConfigDeadLetters(t *testing.T) {
+	c := NewConfig()
+	if c.MaxDeadLetters != 1000 {
+		t.Errorf("default MaxDeadLetters should be 1000, got %d", c.MaxDeadLetters)
+	}
+
+	if err := c.Set("max_dead_letters", 128); err != nil {
+		t.Fatalf("failed to set max_dead_letters: %s", err)
+	}
+	if c.MaxDeadLetters != 128 {
+		t.Errorf("MaxDeadLetters should be 128, got %d", c.MaxDeadLetters)
+	}
+
+	// 0 disables the dead letter queue and must remain valid
+	if err := c.Set("max_dead_letters", 0); err != nil {
+		t.Fatalf("disabling the DLQ with 0 should be valid: %s", err)
+	}
+
+	if err := c.Set("max_dead_letters", 1000001); err == nil {
+		t.Error("setting max_dead_letters above the max should fail validation")
+	}
+}
+
 func TestExponentialBackoff(t *testing.T) {
 	expected := []time.Duration{
 		1 * time.Second,
