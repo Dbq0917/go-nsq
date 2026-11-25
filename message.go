@@ -28,7 +28,14 @@ type Message struct {
 
 	autoResponseDisabled int32
 	responded            int32
+	responseAction       int32
 }
+
+const (
+	messageResponseNone = iota
+	messageResponseFinish
+	messageResponseRequeue
+)
 
 // NewMessage creates a Message, initializes some metadata,
 // and returns a pointer
@@ -67,6 +74,7 @@ func (m *Message) Finish() {
 	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
 		return
 	}
+	atomic.StoreInt32(&m.responseAction, messageResponseFinish)
 	m.Delegate.OnFinish(m)
 }
 
@@ -102,7 +110,15 @@ func (m *Message) doRequeue(delay time.Duration, backoff bool) {
 	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
 		return
 	}
+	atomic.StoreInt32(&m.responseAction, messageResponseRequeue)
 	m.Delegate.OnRequeue(m, delay, backoff)
+}
+
+// responseOutcome reports which terminal response (if any) the message
+// received: messageResponseFinish, messageResponseRequeue or
+// messageResponseNone.
+func (m *Message) responseOutcome() int32 {
+	return atomic.LoadInt32(&m.responseAction)
 }
 
 // WriteTo implements the WriterTo interface and serializes

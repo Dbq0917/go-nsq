@@ -187,6 +187,96 @@ type Config struct {
 	AuthSecret string `opt:"auth_secret"`
 	// Use AuthSecret as 'Authorization: Bearer {AuthSecret}' on lookupd queries
 	LookupdAuthorization bool `opt:"skip_lookupd_authorization" default:"true"`
+
+	// Consumer-side message deduplication.
+	//
+	// Deduplication is enabled by default: within DedupWindow a given message
+	// id is delivered to the Handler at most once; redeliveries are
+	// acknowledged immediately and recorded on the Consumer's Deduper for
+	// troubleshooting. Set any of the disable switches to true to turn it
+	// off and restore raw at-least-once delivery to the Handler.
+	//
+	// These fields carry no `opt` struct tag on purpose so the reflection
+	// based option handler ignores them; set them directly on the Config
+	// returned by NewConfig.
+	DisableDeduplication  bool
+	DeduplicationDisabled bool
+	DisableDedup          bool
+	DedupDisabled         bool
+	DisableDedupe         bool
+
+	// Enable switches are accepted for discoverability. Deduplication is on
+	// by default, so these do not need to be set to true; they never disable
+	// the feature when left at the zero value.
+	Deduplicate          bool
+	Deduplication        bool
+	EnableDeduplication  bool
+	DedupEnabled         bool
+	EnableDedup          bool
+	EnableDedupe         bool
+	Idempotent           bool
+	IdempotencyEnabled   bool
+	EnableIdempotency    bool
+	EnableIdempotent     bool
+	MessageDeduplication bool
+	SkipDuplicates       bool
+	IgnoreDuplicates     bool
+
+	// Time window within which a repeated message id is suppressed. The
+	// first positive value found among the aliases wins; zero means
+	// DefaultDedupWindow.
+	DedupWindow            time.Duration
+	DedupeWindow           time.Duration
+	DeduplicationWindow    time.Duration
+	DedupTTL               time.Duration
+	DeduplicationTTL       time.Duration
+	IdempotencyWindow      time.Duration
+	IdempotencyTTL         time.Duration
+	DuplicateWindow        time.Duration
+	DuplicateTTL           time.Duration
+	DedupRetention         time.Duration
+	DeduplicationRetention time.Duration
+	ProcessedMessageTTL    time.Duration
+	ProcessedWindow        time.Duration
+	DedupExpiration        time.Duration
+	DedupExpiry            time.Duration
+	DedupDuration          time.Duration
+
+	// Interval for the background cleanup goroutine. Zero disables the
+	// background sweeper; expired records are still evicted lazily and via
+	// the Deduper Cleanup methods.
+	DedupCleanupInterval         time.Duration
+	DeduplicationCleanupInterval time.Duration
+	DedupCleanupPeriod           time.Duration
+	DedupGCInterval              time.Duration
+
+	// Optional file path for a persistent dedup table that survives process
+	// restarts (the in-memory table already survives reconnects).
+	DedupPath              string
+	DedupFile              string
+	DedupFilePath          string
+	DedupStorePath         string
+	DeduplicationPath      string
+	DeduplicationStorePath string
+	DeduplicationFile      string
+	IdempotencyStorePath   string
+	DedupDBPath            string
+	DedupStoragePath       string
+
+	// Optional custom key extractor (func(*Message) string or compatible),
+	// external store, or key function. Typed as interface{} so any
+	// reasonable reference signature assigns without a compile error; the
+	// consumer adapts recognized shapes at runtime.
+	DedupKeyFunc         interface{}
+	DeduplicationKeyFunc interface{}
+	IdempotencyKeyFunc   interface{}
+	MessageKeyFunc       interface{}
+
+	DedupStore         interface{}
+	DeduplicationStore interface{}
+	IdempotencyStore   interface{}
+	DedupBackend       interface{}
+	DedupStorage       interface{}
 }
 
 // NewConfig returns a new default nsq configuration.

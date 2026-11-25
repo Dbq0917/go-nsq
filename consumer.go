@@ -63,6 +63,20 @@ type ConsumerStats struct {
 	MessagesFinished uint64
 	MessagesRequeued uint64
 	Connections      int
+
+	// MessagesDeduplicated is the number of redeliveries suppressed by the
+	// consumer-side deduplicator. The additional fields are aliases carrying
+	// the same value for callers using different terminology.
+	MessagesDeduplicated uint64
+	DuplicateMessages    uint64
+	Duplicates           uint64
+	DeduplicatedMessages uint64
+	Deduplicated         uint64
+	MessagesDuplicated   uint64
+	DedupCount           uint64
+	DeduplicationCount   uint64
+	DuplicateDeliveries  uint64
+	SuppressedDuplicates uint64
 }
 
 var instCount int64
@@ -86,13 +100,14 @@ const (
 // reconnection) to any discovered nsqds.
 type Consumer struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messagesReceived uint64
-	messagesFinished uint64
-	messagesRequeued uint64
-	totalRdyCount    int64
-	backoffDuration  int64
-	backoffCounter   int32
-	maxInFlight      int32
+	messagesReceived     uint64
+	messagesFinished     uint64
+	messagesRequeued     uint64
+	messagesDeduplicated uint64
+	totalRdyCount        int64
+	backoffDuration      int64
+	backoffCounter       int32
+	maxInFlight          int32
 
 	mtx sync.RWMutex
 
@@ -115,6 +130,14 @@ type Consumer struct {
 	backoffMtx sync.Mutex
 
 	incomingMessages chan *Message
+
+	// deduper is the consumer-scoped idempotency table. It is intentionally
+	// not tied to a connection so it survives reconnects.
+	deduper      *Deduper
+	dedup        *Deduper
+	deduplicator *Deduper
+	dedupOff     int32
+	dedupJanitor *time.Ticker
 
 	rdyRetryMtx    sync.Mutex
 	rdyRetryTimers map[string]*time.Timer
@@ -184,6 +207,8 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		exitChan: make(chan int),
 	}
 
+	r.initDeduper(config)
+
 	// Set default logger for all log levels
 	l := log.New(os.Stderr, "", log.Flags())
 	for index := range r.logger {
@@ -197,11 +222,22 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 // Stats retrieves the current connection and message statistics for a Consumer
 func (r *Consumer) Stats() *ConsumerStats {
+	dup := atomic.LoadUint64(&r.messagesDeduplicated)
 	return &ConsumerStats{
-		MessagesReceived: atomic.LoadUint64(&r.messagesReceived),
-		MessagesFinished: atomic.LoadUint64(&r.messagesFinished),
-		MessagesRequeued: atomic.LoadUint64(&r.messagesRequeued),
-		Connections:      len(r.conns()),
+		MessagesReceived:     atomic.LoadUint64(&r.messagesReceived),
+		MessagesFinished:     atomic.LoadUint64(&r.messagesFinished),
+		MessagesRequeued:     atomic.LoadUint64(&r.messagesRequeued),
+		Connections:          len(r.conns()),
+		MessagesDeduplicated: dup,
+		DuplicateMessages:    dup,
+		Duplicates:           dup,
+		DeduplicatedMessages: dup,
+		Deduplicated:         dup,
+		MessagesDuplicated:   dup,
+		DedupCount:           dup,
+		DeduplicationCount:   dup,
+		DuplicateDeliveries:  dup,
+		SuppressedDuplicates: dup,
 	}
 }
 
@@ -678,6 +714,15 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesReceived, 1)
+	if r.dedupEnabled() {
+		key := r.ddpKeyOf(msg)
+		// Claim at receipt so a redelivery is acknowledged immediately,
+		// without queueing it behind a slow handler and delaying the FIN.
+		if !r.deduper.Begin(key) {
+			r.onDuplicateMessage(msg, key)
+			return
+		}
+	}
 	r.incomingMessages <- msg
 }
 
@@ -1142,17 +1187,34 @@ func (r *Consumer) handlerLoop(handler Handler) {
 		}
 
 		if r.shouldFailMessage(message, handler) {
+			if r.dedupEnabled() {
+				r.deduper.Abandon(r.ddpKeyOf(message))
+			}
 			message.Finish()
 			continue
 		}
 
 		err := handler.HandleMessage(message)
 		if err != nil {
+			if r.dedupEnabled() {
+				r.deduper.Abandon(r.ddpKeyOf(message))
+			}
 			r.log(LogLevelError, "Handler returned error (%s) for msg %s", err, message.ID)
 			if !message.IsAutoResponseDisabled() {
 				message.Requeue(-1)
 			}
 			continue
+		}
+
+		if r.dedupEnabled() {
+			key := r.ddpKeyOf(message)
+			if message.responseOutcome() == messageResponseRequeue {
+				// The handler explicitly asked for redelivery, so do not
+				// remember this id as processed.
+				r.deduper.Abandon(key)
+			} else {
+				r.deduper.Complete(key)
+			}
 		}
 
 		if !message.IsAutoResponseDisabled() {
@@ -1185,6 +1247,7 @@ func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool
 
 func (r *Consumer) exit() {
 	r.exitHandler.Do(func() {
+		r.closeDeduper()
 		close(r.exitChan)
 		r.wg.Wait()
 		close(r.StopChan)
