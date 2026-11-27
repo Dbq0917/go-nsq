@@ -60,6 +60,35 @@ Consuming messages from NSQ can be done by creating an instance of a Consumer an
 		consumer.Stop()
 	}
 
+Adaptive In-Flight
+
+Instead of having an external process watch latency and call
+Consumer.ChangeMaxInFlight by hand, a Consumer can self-tune its effective
+in-flight (RDY) budget from observed handler latency and failure rate:
+
+	config := nsq.NewConfig()
+	config.MaxInFlight = 100              // hard upper bound (ceiling)
+	config.EnableAdaptiveInFlight = true
+	consumer, err := nsq.NewConsumer("topic", "channel", config)
+
+The consumer evaluates each AdaptiveAdjustInterval window:
+
+	- elevated handler latency versus the observed no-load latency shrinks the
+	  in-flight count proportionally (Gradient2 style)
+	- a failure rate at or above AdaptiveFailureRateThreshold triggers a
+	  multiplicative decrease
+	- any single handler call approaching the nsqd message timeout
+	  (AdaptiveMsgTimeoutRatio of MsgTimeout) sheds load hardest, keeping
+	  in-flight messages from timing out and being redelivered
+	- sustained healthy windows grow the count additively back up to
+	  MaxInFlight, so a temporary shrink never leaves the consumer under-utilized
+
+The tuned count only ever limits how many new messages are requested; messages
+already being handled are never cancelled, so tuning itself never causes a
+redelivery. It is clamped to [AdaptiveMinInFlight, MaxInFlight].
+ChangeMaxInFlight still adjusts the ceiling (and ChangeMaxInFlight(0) pauses
+message flow). The current effective count is exposed via Consumer.Stats().
+
 Producer
 
 Producing messages can be done by creating an instance of a Producer.

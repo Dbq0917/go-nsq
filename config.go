@@ -177,6 +177,40 @@ type Config struct {
 	// Maximum number of messages to allow in flight (concurrency knob)
 	MaxInFlight int `opt:"max_in_flight" min:"0" default:"1"`
 
+	// EnableAdaptiveInFlight turns on consumer-side self tuning of the
+	// effective in-flight (RDY) count. Instead of relying on external calls
+	// to ChangeMaxInFlight, the consumer shrinks and grows its in-flight
+	// budget from observed handler latency and failure rate.
+	//
+	// MaxInFlight remains the hard upper bound; the tuned value never exceeds
+	// it and never drops below AdaptiveMinInFlight (unless MaxInFlight itself
+	// is set lower, e.g. ChangeMaxInFlight(0) still pauses message flow).
+	EnableAdaptiveInFlight bool `opt:"enable_adaptive_in_flight" default:"false"`
+
+	// Interval at which the adaptive limiter evaluates the latest handling
+	// window and adjusts the effective in-flight count.
+	AdaptiveAdjustInterval time.Duration `opt:"adaptive_adjust_interval" min:"100ms" max:"5m" default:"5s"`
+
+	// Floor the adaptive in-flight count is never allowed to drop below while
+	// MaxInFlight is at least this large. Must be at least 1 so a consumer
+	// always keeps probing and can recover throughput.
+	AdaptiveMinInFlight int `opt:"adaptive_min_in_flight" min:"1" max:"65535" default:"1"`
+
+	// Fraction of messages that may fail in an adjustment window before the
+	// limiter multiplicatively decreases the in-flight count.
+	AdaptiveFailureRateThreshold float64 `opt:"adaptive_failure_rate_threshold" min:"0" max:"1" default:"0.1"`
+
+	// Additive increase applied to the in-flight count on each healthy
+	// window, expressed as a fraction of the current count (rounded up, at
+	// least 1). Smaller values recover more gently after a shrink.
+	AdaptiveGrowthStep float64 `opt:"adaptive_growth_step" min:"0.01" max:"1" default:"0.1"`
+
+	// Fraction of the nsqd message timeout (MsgTimeout) that, once reached by
+	// a single handler invocation, triggers an aggressive in-flight decrease.
+	// This keeps in-flight messages from hitting the nsqd timeout and being
+	// redelivered. Has no effect when MsgTimeout is 0 (server default).
+	AdaptiveMsgTimeoutRatio float64 `opt:"adaptive_msg_timeout_ratio" min:"0.1" max:"1" default:"0.7"`
+
 	// The server-side message timeout for messages delivered to this client
 	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"`
 

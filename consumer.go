@@ -63,6 +63,10 @@ type ConsumerStats struct {
 	MessagesFinished uint64
 	MessagesRequeued uint64
 	Connections      int
+	// MaxInFlight is the effective in-flight (RDY) budget currently applied.
+	// With adaptive in-flight enabled this is the self-tuned value, bounded
+	// by the configured MaxInFlight ceiling.
+	MaxInFlight int32
 }
 
 var instCount int64
@@ -86,13 +90,14 @@ const (
 // reconnection) to any discovered nsqds.
 type Consumer struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messagesReceived uint64
-	messagesFinished uint64
-	messagesRequeued uint64
-	totalRdyCount    int64
-	backoffDuration  int64
-	backoffCounter   int32
-	maxInFlight      int32
+	messagesReceived   uint64
+	messagesFinished   uint64
+	messagesRequeued   uint64
+	totalRdyCount      int64
+	backoffDuration    int64
+	backoffCounter     int32
+	maxInFlight        int32
+	maxInFlightCeiling int32
 
 	mtx sync.RWMutex
 
@@ -118,6 +123,8 @@ type Consumer struct {
 
 	rdyRetryMtx    sync.Mutex
 	rdyRetryTimers map[string]*time.Timer
+
+	adaptive *adaptiveLimiter
 
 	pendingConnections map[string]*Conn
 	connections        map[string]*Conn
@@ -159,6 +166,12 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		return nil, errors.New("invalid channel name")
 	}
 
+	if config.EnableAdaptiveInFlight &&
+		config.MaxInFlight > 0 &&
+		config.MaxInFlight < config.AdaptiveMinInFlight {
+		return nil, errors.New("max_in_flight must be >= adaptive_min_in_flight when adaptive in-flight is enabled")
+	}
+
 	r := &Consumer{
 		id: atomic.AddInt64(&instCount, 1),
 
@@ -166,9 +179,10 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		channel: channel,
 		config:  *config,
 
-		logger:      make([]logger, LogLevelMax+1),
-		logLvl:      LogLevelInfo,
-		maxInFlight: int32(config.MaxInFlight),
+		logger:             make([]logger, LogLevelMax+1),
+		logLvl:             LogLevelInfo,
+		maxInFlight:        int32(config.MaxInFlight),
+		maxInFlightCeiling: int32(config.MaxInFlight),
 
 		incomingMessages: make(chan *Message),
 
@@ -190,6 +204,12 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 		r.logger[index] = l
 	}
 
+	if config.EnableAdaptiveInFlight {
+		r.adaptive = newAdaptiveLimiter(config)
+		r.wg.Add(1)
+		go r.adaptiveLoop()
+	}
+
 	r.wg.Add(1)
 	go r.rdyLoop()
 	return r, nil
@@ -202,6 +222,7 @@ func (r *Consumer) Stats() *ConsumerStats {
 		MessagesFinished: atomic.LoadUint64(&r.messagesFinished),
 		MessagesRequeued: atomic.LoadUint64(&r.messagesRequeued),
 		Connections:      len(r.conns()),
+		MaxInFlight:      r.getMaxInFlight(),
 	}
 }
 
@@ -307,19 +328,71 @@ func (r *Consumer) getMaxInFlight() int32 {
 	return atomic.LoadInt32(&r.maxInFlight)
 }
 
+func (r *Consumer) getMaxInFlightCeiling() int32 {
+	return atomic.LoadInt32(&r.maxInFlightCeiling)
+}
+
 // ChangeMaxInFlight sets a new maximum number of messages this comsumer instance
 // will allow in-flight, and updates all existing connections as appropriate.
 //
 // # For example, ChangeMaxInFlight(0) would pause message flow
 //
 // If already connected, it updates the reader RDY state for each connection.
+//
+// When adaptive in-flight is enabled this only adjusts the hard upper bound
+// (ceiling); the effective in-flight count continues to self-tune underneath
+// it. A value of 0 still pauses message flow immediately.
 func (r *Consumer) ChangeMaxInFlight(maxInFlight int) {
-	if r.getMaxInFlight() == int32(maxInFlight) {
+	if r.getMaxInFlightCeiling() == int32(maxInFlight) {
+		return
+	}
+
+	atomic.StoreInt32(&r.maxInFlightCeiling, int32(maxInFlight))
+
+	if r.adaptive != nil {
+		r.adaptive.setCeiling(maxInFlight)
+		r.applyAdaptiveLimit()
 		return
 	}
 
 	atomic.StoreInt32(&r.maxInFlight, int32(maxInFlight))
+	for _, c := range r.conns() {
+		r.maybeUpdateRDY(c)
+	}
+}
 
+// adaptiveLoop periodically evaluates the latest handling window and applies
+// the resulting in-flight limit to every connection.
+func (r *Consumer) adaptiveLoop() {
+	ticker := time.NewTicker(r.config.AdaptiveAdjustInterval)
+	for {
+		select {
+		case <-ticker.C:
+			r.adaptive.evaluate()
+			r.applyAdaptiveLimit()
+		case <-r.exitChan:
+			ticker.Stop()
+			r.wg.Done()
+			return
+		}
+	}
+}
+
+// applyAdaptiveLimit publishes the self-tuned limit through the existing
+// maxInFlight RDY machinery. It only acts on real changes so connections are
+// not needlessly re-issued RDY commands.
+func (r *Consumer) applyAdaptiveLimit() {
+	limit := int32(r.adaptive.currentLimit())
+	if r.getMaxInFlight() == limit {
+		return
+	}
+
+	snap := r.adaptive.snapshot()
+	r.log(LogLevelInfo,
+		"adaptive in-flight %d (ceiling %d, no-load rtt %s)",
+		snap.Limit, snap.Ceiling, snap.RTTNoLoad)
+
+	atomic.StoreInt32(&r.maxInFlight, limit)
 	for _, c := range r.conns() {
 		r.maybeUpdateRDY(c)
 	}
@@ -585,10 +658,10 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 	}
 
 	if resp != nil {
-		if resp.MaxRdyCount < int64(r.getMaxInFlight()) {
+		if resp.MaxRdyCount < int64(r.getMaxInFlightCeiling()) {
 			r.log(LogLevelWarning,
 				"(%s) max RDY count %d < consumer max in flight %d, truncation possible",
-				conn.String(), resp.MaxRdyCount, r.getMaxInFlight())
+				conn.String(), resp.MaxRdyCount, r.getMaxInFlightCeiling())
 		}
 	}
 
@@ -1141,7 +1214,15 @@ func (r *Consumer) handlerLoop(handler Handler) {
 			goto exit
 		}
 
+		handlingStarted := time.Now()
+
 		if r.shouldFailMessage(message, handler) {
+			if r.adaptive != nil {
+				// Exceeding MaxAttempts is a poison message, not a capacity
+				// signal; account for it as handled so it cannot shrink the
+				// in-flight budget.
+				r.adaptive.observe(time.Since(handlingStarted), true)
+			}
 			message.Finish()
 			continue
 		}
@@ -1149,12 +1230,18 @@ func (r *Consumer) handlerLoop(handler Handler) {
 		err := handler.HandleMessage(message)
 		if err != nil {
 			r.log(LogLevelError, "Handler returned error (%s) for msg %s", err, message.ID)
+			if r.adaptive != nil {
+				r.adaptive.observe(time.Since(handlingStarted), false)
+			}
 			if !message.IsAutoResponseDisabled() {
 				message.Requeue(-1)
 			}
 			continue
 		}
 
+		if r.adaptive != nil {
+			r.adaptive.observe(time.Since(handlingStarted), true)
+		}
 		if !message.IsAutoResponseDisabled() {
 			message.Finish()
 		}
